@@ -18,13 +18,14 @@ class CVRP(object):
 
     NAME = 'cvrp'  # Capacitiated Vehicle Routing Problem
     
-    def __init__(self, p_size, init_val_met = 'greedy', with_assert = False, step_method = '2_opt', P = 250, DUMMY_RATE = 0.2):
+    def __init__(self, p_size, init_val_met = 'greedy', with_assert = False, step_method = '2_opt',dec_method = 'TCH' ,P = 250, DUMMY_RATE = 0.2):
         
         self.size = int(np.ceil(p_size * (1 + DUMMY_RATE)))   # the number of real nodes plus dummy nodes in cvrp
         self.real_size = p_size # the number of real nodes in cvrp
         self.dummy_size = self.size - self.real_size
         self.do_assert = with_assert
         self.step_method = step_method
+        self.dec_method = dec_method
         self.init_val_met = init_val_met
         self.P = P
         print(f'CVRP with {self.real_size} nodes and {self.dummy_size} dummy depot.\n', 
@@ -167,45 +168,68 @@ class CVRP(object):
 
         return get_solution(self.init_val_met).expand(batch_size, self.size).clone()
     
-    def step(self, batch, rec, exchange, pre_bsf, solving_state = None, best_solution = None):
+    def step(self, batch, rec, action, pre_bsf, pref, solving_state = None, best_solution = None):
 
-        bs = exchange.size(0)
-        pre_bsf = pre_bsf.view(bs,-1)
+        bs = action.size(0)
         
-        first = exchange[:,0].view(bs,1)
-        second = exchange[:,1].view(bs,1)
+        #输入进来的pre_bsf维度为[bs,2]或[bs,2,2]
+        
+        pre_bsf = pre_bsf.view(bs,-1,2)
+        #[bs, 1, 2]或[bs, 2, 2]
+        
+        first = action[:,0].view(bs,1)
+        second = action[:,1].view(bs,1)
         
         if self.step_method  == 'swap':
             next_state = self.swap(rec, first, second)
-        elif self.step_method  == '2_opt':            
+        elif self.step_method  == '2_opt':
             next_state = self.two_opt(rec, first, second)
         elif self.step_method  == 'insert':
             next_state = self.insert(rec, first, second)
         else:
             raise NotImplementedError()
         
-        new_obj = self.get_costs(batch, next_state)
+        new_objs = self.get_costs(batch, next_state)
+        # [bs, 2]
+         
+        if self.dec_method == "WS":
+            pre_tch_reward = (pref * pre_bsf).sum(dim=2)
+            #[bs,1]或[bs,2]
+            
+            new_tch_reward = (pref * new_objs).sum(dim=1)
+            # [bs]
+        elif self.dec_method == "TCH":
+            z = torch.ones(pre_bsf.shape).cuda() * 0.0
+            pre_tch_reward = pref * (pre_bsf - z)
+            pre_tch_reward, _ = pre_tch_reward.max(dim=2)
+            #[bs,1]或[bs,2]
+            
+            z = torch.ones(new_objs.shape).cuda() * 0.0
+            new_tch_reward = pref * (new_objs - z)
+            new_tch_reward, _ = new_tch_reward.max(dim=1)
+            # [bs]
         
-        now_bsf = torch.min(torch.cat((new_obj[:,None], pre_bsf[:,-1, None]),-1),-1)[0]
+        now_tch_reward, _index = torch.min(torch.cat((new_tch_reward[:,None], pre_tch_reward[:, -1, None]),-1),-1)
+        #[bs],          [bs]
         
-        reward = pre_bsf[:,-1] - now_bsf
+        _index = _index[:,None,None].expand((bs,1,2))
+        now_bsf = torch.cat((new_objs[:, None, :], pre_bsf[:,-1, None, :]), dim = 1).gather(dim=1, index=_index)
+        
+        reward = pre_tch_reward[:,-1] - now_tch_reward
         
         # update solving state
         solving_state[:,:1] = (1 - (reward > 0).view(-1,1).long()) * (solving_state[:,:1] + 1)
         
-        
         if self.do_perturb:
             
-            perturb_index = (solving_state[:,:1] > self.P).view(-1)
+            perturb_index = (solving_state[:,:1] >= self.P).view(-1)
             solving_state[:,:1][perturb_index.view(-1, 1)] *= 0
             pertrb_cnt = perturb_index.sum().item()
             
             if pertrb_cnt > 0:
                 next_state[perturb_index] =  best_solution[perturb_index]
-            
-            return next_state, reward, torch.cat((new_obj[:,None], now_bsf[:,None]),-1) , solving_state
-        
-        return next_state, reward, torch.cat((new_obj[:,None], now_bsf[:,None]),-1) , solving_state
+
+        return next_state, reward, torch.cat((new_objs[:,None,:], now_bsf), dim = 1), solving_state
     
     def two_opt(self, solution, first, second, is_perturb = False):
         
@@ -273,8 +297,58 @@ class CVRP(object):
         # calculate obj value
         d1 = batch['coordinates'].gather(1, rec.long().unsqueeze(-1).expand(batch_size, size, 2))
         d2 = batch['coordinates']
-        length =  ((d1  - d2).norm(p=2, dim=2)).sum(1)
+        length1 =  ((d1  - d2).norm(p=2, dim=2)).sum(1)
+        
+        
+        
+        
+        make_spans = torch.zeros((batch_size, self.dummy_size)).to(rec.device)
+        arrange = np.arange(batch_size)
+        
+        for index in range(self.dummy_size):
+            pre = torch.full((batch_size,),index).to(rec.device)
+            next = rec[arrange,pre]
+            isDepot = (rec[arrange,pre] < self.dummy_size).to(rec.device)
+            
+            dists = torch.zeros((batch_size, )).to(rec.device)
+            cu_demand = torch.zeros((batch_size, )).to(rec.device)
+            
+            while not isDepot.all():
+                d_pre = batch['coordinates'].gather(1, pre.long().unsqueeze(-1).unsqueeze(-1).expand(batch_size, 1, 2))
+                d_next = batch['coordinates'].gather(1, next.long().unsqueeze(-1).unsqueeze(-1).expand(batch_size, 1, 2))
+                
+                # next[:,None]
+                # batch['demand'].gather(1, next[:,None].long())
+                cu_demand += batch['demand'].gather(1, next[:,None].long()).squeeze(-1)
+ 
+                dist = ((d_pre  - d_next).norm(p=2, dim=2))
+                dist = dist.squeeze(1)
+                dists += dist
 
+                pre = next
+                next = rec[arrange,pre]
+                next[isDepot] = index
+                
+                isDepot = (next < self.dummy_size)
+                
+                if isDepot.all():
+                    d_pre = batch['coordinates'].gather(1, pre.long().unsqueeze(-1).unsqueeze(-1).expand(batch_size, 1, 2))
+                    d_next = batch['coordinates'].gather(1, next.long().unsqueeze(-1).unsqueeze(-1).expand(batch_size, 1, 2))
+                    dist = ((d_pre  - d_next).norm(p=2, dim=2))
+                    dist = dist.squeeze(1)
+                    dists += dist
+
+                
+            make_spans[:,index] += dists
+        
+        # 这里没什么用 纯粹验证
+        length2 = make_spans.sum(1)
+        is_compute_right =  (length1 - length2 < 1e-5).all()
+ 
+        #找出最大的一条子路径
+        max_make_span = make_spans.max(1)[0]
+        length = torch.cat((length1[:,None], max_make_span[:,None]), dim = 1)   
+        
         return length
     
     def preprocessing(self, solutions, batch):
@@ -317,33 +391,39 @@ class CVRPDataset(Dataset):
         self.real_size = size # the number of real nodes in cvrp
 
         if filename is not None:
-            assert os.path.splitext(filename)[1] == '.pkl', 'file name error'
             
-            with open(filename, 'rb') as f:
-                data = pickle.load(f)
-            self.data = [self.make_instance(args) for args in data[offset:offset+num_samples]]
-
+            data = torch.load(filename)
+            self.data = self.make_instance(data) 
+            
         else:            
             self.data = [{'coordinates': torch.cat((torch.FloatTensor(1, 2).uniform_(0, 1).repeat(self.size - self.real_size,1), 
                                                     torch.FloatTensor(self.real_size, 2).uniform_(0, 1)), 0),
                           'demand': torch.cat((torch.zeros(self.size - self.real_size),
                                                torch.FloatTensor(self.real_size).uniform_(1, 10).long() / CAPACITIES[self.real_size]), 0)
                           } for i in range(num_samples)]
-            
-            
         
         self.N = len(self.data)
         print(f'{self.N} instances initialized.')
     
-    def make_instance(self, args):
-        depot, loc, demand, capacity, *args = args
+    def make_instance(self, data):
+        #[200,50]
+        demand = data['demand_data'].squeeze(-1)
+        #[200,2]
+        depot = data['node_data'][:, 0, :]
+        #[200,50,2]
+        loc = data['node_data'][:, 1:, :]
         
-        depot = torch.FloatTensor(depot)
-        loc = torch.FloatTensor(loc)
-        demand = torch.FloatTensor(demand)
+        # depot = torch.FloatTensor(depot)
+        # loc = torch.FloatTensor(loc)
+        # demand = torch.FloatTensor(demand)
         
-        return {'coordinates': torch.cat((depot.view(-1, 2).repeat(self.size - self.real_size,1), loc), 0),
-                'demand': torch.cat((torch.zeros(self.size - self.real_size), demand / capacity), 0) }
+        
+        ret_data = [{'coordinates': torch.cat((depot[i].view(-1, 2).repeat(self.size - self.real_size,1), loc[i]), 0),
+                        'demand': torch.cat((torch.zeros(self.size - self.real_size),demand[i]), 0)
+                          } for i in range(demand.shape[0])]
+        
+        return ret_data
+
         
     def __len__(self):
         return self.N

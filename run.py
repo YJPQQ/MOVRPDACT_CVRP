@@ -54,10 +54,19 @@ def run(opts):
     # Set the device
     opts.device = torch.device("cuda" if opts.use_cuda else "cpu")
     
+    # if opts.graph_size == 20:
+    #     opts.dummy_rate = 0.5
+    # elif opts.graph_size == 50:
+    #     opts.dummy_rate = 0.4
+    # elif opts.graph_size == 100:
+    #     opts.dummy_rate = 0.2
+    opts.dummy_rate = 1
     # Figure out what's the problem
+    
     problem = load_problem(opts.problem)(
                             p_size = opts.graph_size,
                             step_method = opts.step_method,
+                            dec_method = opts.dec_method,
                             init_val_met = opts.init_val_met,
                             with_assert = opts.use_assert,
                             P = opts.P,

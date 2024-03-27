@@ -54,7 +54,16 @@ CUDA_VISIBLE_DEVICES=0,1 python run.py --problem tsp --graph_size 50 --step_meth
 ### CVRP example
 For training CVRP instances with 20 nodes and GPU card 0:
 ```python
-CUDA_VISIBLE_DEVICES=0 python run.py --problem vrp --graph_size 20 --dummy_rate 0.5 --step_method 2_opt --n_step 5 --T_train 250 --Xi_CL 1 --best_cl --max_grad_norm 0.04 --val_m 1 --val_dataset  './datasets/cvrp_20_10000.pkl' --run_name 'example_training_CVRP20'
+CUDA_VISIBLE_DEVICES=3 python run.py --problem vrp --graph_size 20 --dummy_rate 1 --step_method 2_opt --n_step 5 --T_train 250 --Xi_CL 1 --best_cl --max_grad_norm 0.04 --val_m 1 --val_dataset  './data/testdata_cvrp_size20.pt' --val_size 200 --run_name 'direct_cvrp20_SUTONG' --validate_interval 5 --batch_size 128 --epoch_size 128 --n_sols 3 > ./train_details_log/direct_cvrp20_SUTONG.txt 
+
+CUDA_VISIBLE_DEVICES=3 python run.py --problem vrp --graph_size 20 --dummy_rate 1 --step_method 2_opt --n_step 5 --T_train 250 --Xi_CL 1 --best_cl --max_grad_norm 0.04 --val_m 1 --val_dataset  './data/testdata_cvrp_size20.pt' --val_size 200 --run_name 'direct_cvrp20' --T_max 1000 --validate_interval 5 --n_sols 20  > ./train_details_log/direct_cvrp20.txt 
+
+
+
+
+
+
+
 ```
 Note: hyper-parameters ''--n_step 5 --T_train 250'' are good enough for CVRP now. And we consider loading the pre-trained models of TSP50, CVRP20, and CVRP50 to train TSP100, CVRP-50, and CVRP100 for faster convergency respectively. Please pay attention to the argument "--dummy_rate" for CVRP where we should use different values for different CVRP sizes (e.g., we use 0.5 for CVRP20, 0.4 for CVRP50, and 0.2 for CVRP100).
 

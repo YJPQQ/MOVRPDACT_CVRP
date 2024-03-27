@@ -27,8 +27,8 @@ def log_to_screen(time_used, init_value, best_value, reward, costs_history, sear
         print(f'Avg best cost after T={per} steps:'.center(35), '{:<10f} +- {:<10f}'.format(
                 cost_.mean(), 
                 torch.std(cost_) / math.sqrt(batch_size)))
-    print('Avg final best cost:'.center(35), '{:<10f} +- {:<10f}'.format(
-                best_value.mean(), torch.std(best_value) / math.sqrt(batch_size)))
+    print('Avg final best cost: obj1:'.center(35), '{:<10f} +- obj2:{:<10f} +- {:<10f} +- {:<10f}'.format(
+                best_value[:,0].mean(),best_value[:,1].mean(),torch.std(best_value[:,0]) / math.sqrt(batch_size),torch.std(best_value[:,1]) / math.sqrt(batch_size)))
     
     # time
     print('-'*60)
@@ -45,7 +45,8 @@ def log_to_tb_val(tb_logger, time_used, init_value, best_value, reward, costs_hi
     
     
     tb_logger.log_value('validation/avg_init_cost', init_value.mean(), epoch)
-    tb_logger.log_value('validation/avg_best_cost', best_value.mean(), epoch)
+    tb_logger.log_value('validation/avg_best_cost,obj1', best_value[:,0].mean(), epoch)
+    tb_logger.log_value('validation/avg_best_cost,obj2', best_value[:,1].mean(), epoch)
 
     for per in range(20,100,20):
         cost_ = costs_history[:,round(T*per/100)]

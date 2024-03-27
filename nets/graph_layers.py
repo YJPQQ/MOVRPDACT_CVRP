@@ -540,6 +540,7 @@ class EmbeddingNet(nn.Module):
         self.node_dim = node_dim
         self.embedding_dim = embedding_dim
         self.embedder = nn.Linear(node_dim, embedding_dim, bias = False)
+        self.PFE_embedder1 = nn.Linear(embedding_dim + 2, embedding_dim)
         
         # Two ways for generalizing CPEs:
         # -- 1. Use the target size CPE directly (default)
@@ -597,7 +598,10 @@ class EmbeddingNet(nn.Module):
         
         return pattern    
 
-    def position_encoding(self, solutions, embedding_dim, visited_time):
+    def position_encoding(self, solutions, embedding_dim, visited_time,pref):
+        
+        
+         concat_embedding_dim = embedding_dim + 2
         
          # batch: batch_size, problem_size, dim
          batch_size, seq_length = solutions.size()
@@ -605,6 +609,8 @@ class EmbeddingNet(nn.Module):
          
          # expand for every batch
          CPE_embeddings = self.pattern.expand(batch_size, seq_length, embedding_dim).clone().to(solutions.device)
+         concat_pref = pref[None, None, :] .expand(batch_size, seq_length, -1)
+         CPE_embeddings = torch.cat((CPE_embeddings, concat_pref), dim = 2).to(solutions.device)
          
          # get index according to the solutions
          if visited_time is None:
@@ -613,12 +619,13 @@ class EmbeddingNet(nn.Module):
              for i in range(seq_length):
                 visited_time[arange,solutions[arange,pre]] = i+1
                 pre = solutions[arange,pre]
-         index = (visited_time % seq_length).long().unsqueeze(-1).expand(batch_size, seq_length, embedding_dim)
+         index = (visited_time % seq_length).long().unsqueeze(-1).expand(batch_size, seq_length, concat_embedding_dim)
          
          return torch.gather(CPE_embeddings, 1, index), visited_time.long()
 
         
-    def forward(self, x, solutions, visited_time = None):
-        PFEs, visited_time = self.position_encoding(solutions, self.embedding_dim, visited_time)
+    def forward(self, x, solutions,pref, visited_time = None):
+        PFEs, visited_time = self.position_encoding(solutions, self.embedding_dim, visited_time,pref)
+        PFEs = self.PFE_embedder1(PFEs)
         NFEs = self.embedder(x)
         return  NFEs, PFEs, visited_time

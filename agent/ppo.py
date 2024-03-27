@@ -127,11 +127,12 @@ class PPO:
         self.actor.train()
         if not self.opts.eval_only: self.critic.train()
     
-    def rollout(self, problem, val_m, batch, do_sample = False, record = False, show_bar = False):
+    def rollout(self, problem, val_m, batch, pref,do_sample = False, record = False, show_bar = False):
         
         # get instances and do data augments
         assert val_m <= 8
         batch = move_to(batch, self.opts.device)
+        
         bs, gs, dim = batch['coordinates'].size()
         batch['coordinates'] = batch['coordinates'].unsqueeze(1).repeat(1,val_m,1,1)      
         if problem.NAME == 'cvrp': batch['demand'] = batch['demand'].unsqueeze(1).repeat(1,val_m,1).view(-1, gs)   
@@ -162,15 +163,30 @@ class PPO:
         # get initial solutions
         solutions = move_to(problem.get_initial_solutions(batch), self.opts.device).long()
         # get initial cost
-        obj = problem.get_costs(batch, solutions)
+        objs = problem.get_costs(batch, solutions)
         
-        obj_history = [torch.cat((obj[:,None],obj[:,None]),-1)]
+        if problem.dec_method == "WS":
+            objs_tch_reward = (pref * objs).sum(dim=1)
+            # [bs]
+        elif problem.dec_method == "TCH":
+            z = torch.ones(objs.shape).cuda() * 0.0
+            objs_tch_reward = pref * (objs - z)
+            objs_tch_reward, _ = objs_tch_reward.max(dim=1)
+            # [bs]
+
+        obj_history = [torch.cat((objs_tch_reward[:,None],objs_tch_reward[:,None]),-1)]
         reward = []
         solution_history = [solutions.clone()]
         best_solution = solutions.clone()
         
         # prepare the features
         batch_feature = problem.input_feature_encoding(batch)
+        pref = pref.cuda() if self.opts.distributed \
+                        else move_to(pref, self.opts.device)
+        batch_pref = pref.expand(self.opts.val_size,problem.size,2)
+        batch_feature_pref = torch.cat((batch_feature, batch_pref), dim = 2)
+        batch_feature_pref = batch_feature_pref.cuda() if self.opts.distributed \
+                            else move_to(batch_feature_pref, self.opts.device)
         
         action = None
         solving_state = torch.zeros((batch_feature.size(0),1), device = self.opts.device).long()
@@ -180,27 +196,40 @@ class PPO:
             
              # pass through model
             action = self.actor(problem,
-                                  batch_feature,
+                                  batch_feature_pref,
                                   solutions,
                                   action,
+                                  pref,
                                   do_sample = do_sample)[0]
 
             # state trasition
-            solutions, rewards, obj, solving_state = problem.step(batch, 
+            solutions, rewards, objs, solving_state = problem.step(batch, 
                                                                   solutions, 
                                                                   action, 
-                                                                  obj, 
+                                                                  objs, 
+                                                                  pref,
                                                                   solving_state, 
                                                                   best_solution = best_solution)
 
             # record informations
             best_solution[rewards > 0] = solutions[rewards > 0]
             reward.append(rewards)  
-            obj_history.append(obj)
+            
+            if problem.dec_method == "WS":
+                objs_tch_reward = (pref * objs).sum(dim=2)
+                # [bs]
+            elif problem.dec_method == "TCH":
+                z = torch.ones(objs.shape).cuda() * 0.0
+                objs_tch_reward = pref * (objs - z)
+                objs_tch_reward, _ = objs_tch_reward.max(dim=2)
+                # [bs]
+            
+            
+            obj_history.append(objs_tch_reward)
             if record: solution_history.append(solutions.clone())
             
         
-        out = (obj[:,-1].reshape(bs, val_m).min(1)[0], # batch_size, 1
+        out = (objs[:,-1,:].reshape(bs, val_m,2).min(1)[0], # batch_size, 1
                torch.stack(obj_history,1)[:,:,0].view(bs, val_m, -1).min(1)[0],  # batch_size, T
                torch.stack(obj_history,1)[:,:,-1].view(bs, val_m, -1).min(1)[0],  # batch_size, T
                torch.stack(reward,1).view(bs, val_m, -1).max(1)[0], # batch_size, T
@@ -306,7 +335,11 @@ def train(rank, problem, agent, val_dataset, tb_logger):
             
         
         # validate the new model        
-        if rank == 0: validate(rank, problem, agent, val_dataset, tb_logger, _id = epoch)
+        if rank == 0: 
+            validate_interval = opts.validate_interval
+            if ((epoch == 0) or ((epoch + 1) % validate_interval == 0)):
+                
+                validate(rank, problem, agent, val_dataset, tb_logger, _id = epoch)
         
         # syn
         if opts.distributed: dist.barrier()
@@ -333,6 +366,20 @@ def train_batch(
     batch_feature = problem.input_feature_encoding(batch).cuda() if opts.distributed \
                         else move_to(problem.input_feature_encoding(batch), opts.device)
     batch_size = batch_feature.size(0)
+    problem_size = batch_feature.size(1)
+    
+    pref = torch.rand((2))
+    pref = pref / torch.sum(pref)
+    pref = pref.cuda() if opts.distributed \
+                        else move_to(pref, opts.device)
+    batch_pref = pref.expand(batch_size,problem_size,2)
+    batch_feature_pref = torch.cat((batch_feature, batch_pref), dim = 2)
+    batch_feature_pref = batch_feature_pref.cuda() if opts.distributed \
+                        else move_to(batch_feature_pref, opts.device)
+    
+    
+    
+    
     action = move_to_cuda(torch.tensor([1,1]).repeat(batch_size,1), rank) if opts.distributed \
                         else move_to(torch.tensor([1,1]).repeat(batch_size,1), opts.device)
     solving_state = move_to_cuda(torch.zeros((batch_feature.size(0),1)).long(), rank) if opts.distributed \
@@ -341,7 +388,7 @@ def train_batch(
     # initial solution
     solution = move_to_cuda(problem.get_initial_solutions(batch),rank) if opts.distributed \
                         else move_to(problem.get_initial_solutions(batch), opts.device)
-    obj = problem.get_costs(batch, solution)
+    objs = problem.get_costs(batch, solution)
     
     # CL strategy
     if opts.Xi_CL:
@@ -361,22 +408,24 @@ def train_batch(
             
             # get model output	
             action = agent.actor( problem,
-                                 batch_feature,
+                                 batch_feature_pref,
                                  solution,
                                  action,
+                                 pref,
                                  do_sample = True)[0]
              
             # state transient	
-            solution, rewards, obj, solving_state = problem.step(batch, solution, action, obj, solving_state)
+            solution, rewards, objs, solving_state = problem.step(batch, solution, action, objs, pref, solving_state)
             
             if opts.best_cl:
-                index = obj[:,0] == obj[:,1]
+                index = objs[:,0] == objs[:,1]
+                index = index.all(dim = 1)
                 solution_best[index] = solution[index].clone()
         
         if opts.best_cl:
             solution = solution_best.clone()
             
-        obj = problem.get_costs(batch, solution)
+        objs = problem.get_costs(batch, solution)
         
         agent.train()
         problem.train()    
@@ -387,7 +436,7 @@ def train_batch(
     T = opts.T_train
     K_epochs = opts.K_epochs
     eps_clip = opts.eps_clip
-    initial_cost = obj
+    initial_cost = objs
     solving_state = torch.zeros((batch_feature.size(0),1)).long().cuda() if opts.distributed \
                     else torch.zeros((batch_feature.size(0),1), device = opts.device).long()
     
@@ -408,9 +457,10 @@ def train_batch(
             
             # get model output
             action, log_lh, _to_critic, entro_p  = agent.actor(problem,
-                                                               batch_feature,
+                                                               batch_feature_pref,
                                                                solution,
                                                                action,
+                                                               pref,
                                                                do_sample = True,
                                                                require_entropy = True,
                                                                to_critic = True)
@@ -427,11 +477,11 @@ def train_batch(
             bl_val.append(baseline_val)
                 
             # state transient
-            solution, rewards, obj, solving_state = problem.step(batch, solution, action, obj, solving_state)
+            solution, rewards, objs, solving_state = problem.step(batch, solution, action, objs, pref,solving_state)
             memory.rewards.append(rewards)
             
             # store info
-            total_cost = total_cost + obj[:,-1]
+            total_cost = total_cost + objs[:,-1]
             
             # next            
             t = t + 1
@@ -468,9 +518,10 @@ def train_batch(
                 
                     # get new action_prob
                     _, log_p, _to_critic, entro_p = agent.actor(problem,
-                                                                batch_feature,
+                                                                batch_feature_pref,
                                                                 old_states[tt],
                                                                 old_exchange[tt],
+                                                                pref,
                                                                 # memory.solving_state[tt].float() / T,
                                                                 fixed_action = old_actions[tt],
                                                                 require_entropy = True,# take same action
@@ -495,7 +546,7 @@ def train_batch(
             reward_reversed = memory.rewards[::-1]
             
             # get next value
-            R = agent.critic(agent.actor(problem,batch_feature,solution,action,only_critic = True))[0]
+            R = agent.critic(agent.actor(problem,batch_feature_pref,solution,action,pref,only_critic = True))[0]
             for r in range(len(reward_reversed)):
                 R = R * gamma + reward_reversed[r]
                 Reward.append(R)

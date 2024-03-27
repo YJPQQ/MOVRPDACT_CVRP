@@ -41,7 +41,7 @@ class Actor(nn.Module):
         if problem_name == 'tsp':
             self.node_dim = 2
         elif problem_name == 'cvrp':
-            self.node_dim = 7
+            self.node_dim = 9
         else:            
             assert False, "Unsupported problem: {}".format(self.problem.NAME)        
 
@@ -70,7 +70,7 @@ class Actor(nn.Module):
         trainable_num = sum(p.numel() for p in self.parameters() if p.requires_grad)
         return {'Total': total_num, 'Trainable': trainable_num}
 
-    def forward(self, problem, x_in, solution, exchange, do_sample = False, fixed_action = None, require_entropy = False, to_critic = False, only_critic  = False):
+    def forward(self, problem, x_in, solution, exchange,pref, do_sample = False, fixed_action = None, require_entropy = False, to_critic = False, only_critic  = False):
 
         bs, gs, in_d = x_in.size()
         
@@ -94,11 +94,17 @@ class Actor(nn.Module):
             
             # concate the 7-dim features x_in
             x_in = torch.cat((x_in[:,:,:4], to_actor), -1)
+            batch_size = x_in.shape[0]
+            seq_length = x_in.shape[1]
+            
+            concat_pref = pref[None,None,:].expand(batch_size,seq_length,-1)
+            x_in = torch.cat((x_in, concat_pref), -1)
+            
             del to_actor
             contex = contex % 1000 // 1
             
             # pass through embedder to get embeddings
-            NFE, PFE, visited_time = self.embedder(x_in, solution, visited_time = contex)
+            NFE, PFE, visited_time = self.embedder(x_in, solution, pref,visited_time = contex)
         
         elif problem.NAME == 'tsp':
             # pass through embedder
